@@ -4,7 +4,8 @@ import NIOCore
 import NIOHTTP1
 import Vapor
 
-struct FynnCloudAPIClient {
+struct FynnCloudAPIClient: Sendable {
+    let client: HTTPClient
     let baseURL: String
 
     private static let decoder: JSONDecoder = {
@@ -13,155 +14,227 @@ struct FynnCloudAPIClient {
         return d
     }()
 
-    init(baseURL: String = Environment.get("FYNNCLOUD_API_URL") ?? "http://127.0.0.1:8080") {
+    init(client: HTTPClient, baseURL: String = Environment.get("FYNNCLOUD_API_URL") ?? "http://127.0.0.1:8080") {
+        self.client = client
         self.baseURL = baseURL.hasSuffix("/") ? String(baseURL.dropLast()) : baseURL
     }
 
-    func resolvePath(_ segments: [String], token: String, on req: Request) async throws -> FileIndexItemDTO? {
+    init(app: Application, baseURL: String = Environment.get("FYNNCLOUD_API_URL") ?? "http://127.0.0.1:8080") {
+        self.init(client: app.http.client.shared, baseURL: baseURL)
+    }
+
+    init(req: Request, baseURL: String = Environment.get("FYNNCLOUD_API_URL") ?? "http://127.0.0.1:8080") {
+        self.init(client: req.application.http.client.shared, baseURL: baseURL)
+    }
+
+    // MARK: - File Metadata & Navigation
+
+    func getFile(id: UUID, token: String) async throws -> FileIndexItemDTO {
+        var req = HTTPClientRequest(url: "\(baseURL)/api/files/\(id.uuidString)")
+        req.method = .GET
+        req.headers.bearerAuthorization = BearerAuthorization(token: token)
+
+        let res = try await client.execute(req, timeout: .seconds(30))
+        guard res.status == .ok else {
+            throw Abort(res.status, reason: "Unable to retrieve file \(id)")
+        }
+
+        let buffer = try await res.body.collect(upTo: 1024 * 1024)
+        return try Self.decoder.decode(FileIndexItemDTO.self, from: buffer)
+    }
+
+    func resolvePath(_ segments: [String], token: String) async throws -> FileIndexItemDTO? {
         let path = segments.joined(separator: "/")
         guard let encoded = path.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) else {
             return nil
         }
 
-        let res = try await req.client.get(URI(string: "\(baseURL)/api/files/resolve?path=\(encoded)")) { clientReq in
-            clientReq.headers.bearerAuthorization = BearerAuthorization(token: token)
-        }
+        var req = HTTPClientRequest(url: "\(baseURL)/api/files/resolve?path=\(encoded)")
+        req.method = .GET
+        req.headers.bearerAuthorization = BearerAuthorization(token: token)
 
+        let res = try await client.execute(req, timeout: .seconds(30))
         if res.status == .notFound {
             return nil
         }
-        guard res.status == .ok, let body = res.body else {
+        guard res.status == .ok else {
             throw Abort(res.status)
         }
-        return try Self.decoder.decode(FileIndexItemDTO.self, from: body)
+
+        let buffer = try await res.body.collect(upTo: 1024 * 1024)
+        return try Self.decoder.decode(FileIndexItemDTO.self, from: buffer)
     }
 
-    func listChildren(folderID: UUID?, token: String, on req: Request) async throws -> [FileIndexItemDTO] {
-        let uri = folderID.map { "\(baseURL)/api/files?parentID=\($0.uuidString)" } ?? "\(baseURL)/api/files"
-        let res = try await req.client.get(URI(string: uri)) { clientReq in
-            clientReq.headers.bearerAuthorization = BearerAuthorization(token: token)
-        }
-        guard res.status == .ok, let body = res.body else {
+    func listChildren(folderID: UUID?, token: String) async throws -> [FileIndexItemDTO] {
+        let url = folderID.map { "\(baseURL)/api/files?parentID=\($0.uuidString)" } ?? "\(baseURL)/api/files"
+        var req = HTTPClientRequest(url: url)
+        req.method = .GET
+        req.headers.bearerAuthorization = BearerAuthorization(token: token)
+
+        let res = try await client.execute(req, timeout: .seconds(30))
+        guard res.status == .ok else {
             throw Abort(res.status)
         }
-        let listing = try Self.decoder.decode(FileIndexDTO.self, from: body)
+
+        let buffer = try await res.body.collect(upTo: 10 * 1024 * 1024)
+        let listing = try Self.decoder.decode(FileIndexDTO.self, from: buffer)
         return listing.files
     }
 
-    func createDirectory(name: String, parentID: UUID?, token: String, on req: Request) async throws -> FileIndexItemDTO {
-        struct RequestBody: Content {
+    // MARK: - Directory & File Operations
+
+    func createDirectory(name: String, parentID: UUID?, token: String) async throws -> FileIndexItemDTO {
+        struct Payload: Content {
             let name: String
             let parentID: UUID?
         }
 
-        let res = try await req.client.post(URI(string: "\(baseURL)/api/files/create-directory")) { clientReq in
-            clientReq.headers.bearerAuthorization = BearerAuthorization(token: token)
-            try clientReq.content.encode(RequestBody(name: name, parentID: parentID))
-        }
+        var req = HTTPClientRequest(url: "\(baseURL)/api/files/create-directory")
+        req.method = .POST
+        req.headers.bearerAuthorization = BearerAuthorization(token: token)
+        req.headers.replaceOrAdd(name: .contentType, value: "application/json")
+        req.body = .bytes(try JSONEncoder().encode(Payload(name: name, parentID: parentID)))
 
+        let res = try await client.execute(req, timeout: .seconds(30))
         if res.status == .conflict {
             throw Abort(.methodNotAllowed, reason: "Resource already exists")
         }
-        guard res.status == .ok || res.status == .created, let body = res.body else {
+        guard res.status == .ok || res.status == .created else {
             throw Abort(res.status)
         }
-        return try Self.decoder.decode(FileIndexItemDTO.self, from: body)
+
+        let buffer = try await res.body.collect(upTo: 1024 * 1024)
+        return try Self.decoder.decode(FileIndexItemDTO.self, from: buffer)
     }
 
-    func rename(fileID: UUID, to newName: String, token: String, on req: Request) async throws -> FileIndexItemDTO {
-        struct RequestBody: Content {
+    func rename(fileID: UUID, to newName: String, token: String) async throws -> FileIndexItemDTO {
+        struct Payload: Content {
             let name: String
         }
 
-        let res = try await req.client.patch(URI(string: "\(baseURL)/api/files/\(fileID.uuidString)")) { clientReq in
-            clientReq.headers.bearerAuthorization = BearerAuthorization(token: token)
-            try clientReq.content.encode(RequestBody(name: newName))
-        }
-        guard res.status == .ok, let body = res.body else {
+        var req = HTTPClientRequest(url: "\(baseURL)/api/files/\(fileID.uuidString)")
+        req.method = .PATCH
+        req.headers.bearerAuthorization = BearerAuthorization(token: token)
+        req.headers.replaceOrAdd(name: .contentType, value: "application/json")
+        req.body = .bytes(try JSONEncoder().encode(Payload(name: newName)))
+
+        let res = try await client.execute(req, timeout: .seconds(30))
+        guard res.status == .ok else {
             throw Abort(res.status)
         }
-        return try Self.decoder.decode(FileIndexItemDTO.self, from: body)
+
+        let buffer = try await res.body.collect(upTo: 1024 * 1024)
+        return try Self.decoder.decode(FileIndexItemDTO.self, from: buffer)
     }
 
-    func move(fileID: UUID, toParentID: UUID?, token: String, on req: Request) async throws {
-        struct RequestBody: Content {
+    func move(fileID: UUID, toParentID: UUID?, token: String) async throws {
+        struct Payload: Content {
             let ids: [UUID]
             let parentID: UUID?
         }
 
-        let res = try await req.client.post(URI(string: "\(baseURL)/api/files/move")) { clientReq in
-            clientReq.headers.bearerAuthorization = BearerAuthorization(token: token)
-            try clientReq.content.encode(RequestBody(ids: [fileID], parentID: toParentID))
-        }
+        var req = HTTPClientRequest(url: "\(baseURL)/api/files/move")
+        req.method = .POST
+        req.headers.bearerAuthorization = BearerAuthorization(token: token)
+        req.headers.replaceOrAdd(name: .contentType, value: "application/json")
+        req.body = .bytes(try JSONEncoder().encode(Payload(ids: [fileID], parentID: toParentID)))
+
+        let res = try await client.execute(req, timeout: .seconds(30))
         guard res.status == .ok else {
             throw Abort(res.status)
         }
     }
 
-    func copy(fileID: UUID, toParentID: UUID?, newName: String?, token: String, on req: Request) async throws -> FileIndexItemDTO {
-        struct RequestBody: Content {
+    func copy(fileID: UUID, toParentID: UUID?, newName: String?, token: String) async throws -> FileIndexItemDTO {
+        struct Payload: Content {
             let id: UUID
             let parentID: UUID?
             let name: String?
         }
 
-        let res = try await req.client.post(URI(string: "\(baseURL)/api/files/copy")) { clientReq in
-            clientReq.headers.bearerAuthorization = BearerAuthorization(token: token)
-            try clientReq.content.encode(RequestBody(id: fileID, parentID: toParentID, name: newName))
-        }
-        guard res.status == .ok || res.status == .created, let body = res.body else {
+        var req = HTTPClientRequest(url: "\(baseURL)/api/files/copy")
+        req.method = .POST
+        req.headers.bearerAuthorization = BearerAuthorization(token: token)
+        req.headers.replaceOrAdd(name: .contentType, value: "application/json")
+        req.body = .bytes(try JSONEncoder().encode(Payload(id: fileID, parentID: toParentID, name: newName)))
+
+        let res = try await client.execute(req, timeout: .seconds(30))
+        guard res.status == .ok || res.status == .created else {
             throw Abort(res.status)
         }
-        return try Self.decoder.decode(FileIndexItemDTO.self, from: body)
+
+        let buffer = try await res.body.collect(upTo: 1024 * 1024)
+        return try Self.decoder.decode(FileIndexItemDTO.self, from: buffer)
     }
 
-    func delete(fileID: UUID, token: String, on req: Request) async throws {
-        struct RequestBody: Content {
+    func delete(fileID: UUID, token: String) async throws {
+        struct Payload: Content {
             let ids: [UUID]
         }
 
-        let res = try await req.client.post(URI(string: "\(baseURL)/api/files/trash")) { clientReq in
-            clientReq.headers.bearerAuthorization = BearerAuthorization(token: token)
-            try clientReq.content.encode(RequestBody(ids: [fileID]))
-        }
+        var req = HTTPClientRequest(url: "\(baseURL)/api/files/trash")
+        req.method = .POST
+        req.headers.bearerAuthorization = BearerAuthorization(token: token)
+        req.headers.replaceOrAdd(name: .contentType, value: "application/json")
+        req.body = .bytes(try JSONEncoder().encode(Payload(ids: [fileID])))
+
+        let res = try await client.execute(req, timeout: .seconds(30))
         guard res.status == .ok || res.status == .noContent else {
             throw Abort(res.status)
         }
     }
 
-    func download(fileID: UUID, headers: HTTPHeaders, token: String, on req: Request) async throws -> Response {
-        var clientReq = HTTPClientRequest(url: "\(baseURL)/api/files/\(fileID.uuidString)/download")
-        clientReq.method = .GET
-        clientReq.headers.bearerAuthorization = BearerAuthorization(token: token)
+    // MARK: - Download & Upload Streaming
+
+    func download(fileID: UUID, headers: HTTPHeaders = [:], token: String) async throws -> Response {
+        var req = HTTPClientRequest(url: "\(baseURL)/api/files/\(fileID.uuidString)/download")
+        req.method = .GET
+        req.headers.bearerAuthorization = BearerAuthorization(token: token)
 
         if let range = headers.first(name: .range) {
-            clientReq.headers.replaceOrAdd(name: .range, value: range)
+            req.headers.replaceOrAdd(name: .range, value: range)
         }
         if let ifNoneMatch = headers.first(name: .ifNoneMatch) {
-            clientReq.headers.replaceOrAdd(name: .ifNoneMatch, value: ifNoneMatch)
+            req.headers.replaceOrAdd(name: .ifNoneMatch, value: ifNoneMatch)
         }
 
-        let client = req.application.http.client.shared
-        let clientRes = try await client.execute(clientReq, timeout: .minutes(60))
-
-        let response = Response(status: clientRes.status, headers: clientRes.headers)
+        let res = try await client.execute(req, timeout: .minutes(60))
+        let response = Response(status: res.status, headers: res.headers)
         response.body = .init(managedAsyncStream: { writer in
-            for try await chunk in clientRes.body {
+            for try await chunk in res.body {
                 try await writer.write(.buffer(chunk))
             }
         })
         return response
     }
 
+    func download(fileID: UUID, to destination: URL, token: String) async throws {
+        var req = HTTPClientRequest(url: "\(baseURL)/api/files/\(fileID.uuidString)/download")
+        req.method = .GET
+        req.headers.bearerAuthorization = BearerAuthorization(token: token)
+
+        let res = try await client.execute(req, timeout: .minutes(10))
+        guard res.status == .ok else {
+            throw Abort(res.status, reason: "Failed to download file \(fileID)")
+        }
+
+        FileManager.default.createFile(atPath: destination.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: destination)
+        defer { try? handle.close() }
+
+        for try await chunk in res.body {
+            handle.write(Data(buffer: chunk))
+        }
+    }
+
     func upload(
         filename: String,
         parentID: UUID?,
-        stream: Request.Body,
+        body: HTTPClientRequest.Body,
         contentLength: Int64?,
         contentType: String,
         token: String,
-        overwrite: Bool,
-        on req: Request
+        overwrite: Bool
     ) async throws -> Response {
         var query = [
             "filename=\(filename.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? filename)",
@@ -174,24 +247,70 @@ struct FynnCloudAPIClient {
             query.append("size=\(contentLength)")
         }
 
-        var clientReq = HTTPClientRequest(url: "\(baseURL)/api/files/upload?\(query.joined(separator: "&"))")
-        clientReq.method = .POST
-        clientReq.headers.bearerAuthorization = BearerAuthorization(token: token)
-        clientReq.headers.replaceOrAdd(name: .contentType, value: contentType)
-
+        var req = HTTPClientRequest(url: "\(baseURL)/api/files/upload?\(query.joined(separator: "&"))")
+        req.method = .POST
+        req.headers.bearerAuthorization = BearerAuthorization(token: token)
+        req.headers.replaceOrAdd(name: .contentType, value: contentType)
         if let contentLength {
-            clientReq.headers.replaceOrAdd(name: .contentLength, value: String(contentLength))
-            clientReq.body = .stream(stream, length: .known(contentLength))
-        } else {
-            clientReq.body = .stream(stream, length: .unknown)
+            req.headers.replaceOrAdd(name: .contentLength, value: String(contentLength))
+        }
+        req.body = body
+
+        let res = try await client.execute(req, timeout: .hours(4))
+        guard res.status == .ok || res.status == .created else {
+            throw Abort(res.status)
+        }
+        return Response(status: res.status)
+    }
+
+    func uploadArchive(
+        name: String,
+        fileURL: URL,
+        size: Int64,
+        parentID: UUID?,
+        token: String
+    ) async throws -> (finalName: String, fileID: UUID?) {
+        let zipData = try Data(contentsOf: fileURL, options: .mappedIfSafe)
+        var candidateName = name
+
+        for attempt in 1...20 {
+            var query = [
+                "filename=\(candidateName.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? candidateName)",
+                "overwrite=false",
+                "size=\(size)",
+                "contentType=application/zip"
+            ]
+            if let parentID {
+                query.append("parentID=\(parentID.uuidString)")
+            }
+
+            var req = HTTPClientRequest(url: "\(baseURL)/api/files/upload?\(query.joined(separator: "&"))")
+            req.method = .POST
+            req.headers.bearerAuthorization = BearerAuthorization(token: token)
+            req.headers.replaceOrAdd(name: .contentType, value: "application/zip")
+            req.headers.replaceOrAdd(name: .contentLength, value: String(size))
+            req.body = .bytes(zipData)
+
+            let res = try await client.execute(req, timeout: .minutes(5))
+
+            if res.status == .ok || res.status == .created {
+                var createdID: UUID?
+                if let body = try? await res.body.collect(upTo: 64 * 1024) {
+                    struct UploadResult: Decodable { let id: UUID? }
+                    createdID = try? JSONDecoder().decode(UploadResult.self, from: body).id
+                }
+                return (candidateName, createdID)
+            }
+
+            if res.status == .conflict {
+                let stem = (name as NSString).deletingPathExtension
+                candidateName = "\(stem) (\(attempt)).zip"
+                continue
+            }
+
+            throw Abort(res.status, reason: "Failed to upload archive to destination")
         }
 
-        let client = req.application.http.client.shared
-        let clientRes = try await client.execute(clientReq, timeout: .hours(4))
-
-        guard clientRes.status == .ok || clientRes.status == .created else {
-            throw Abort(clientRes.status)
-        }
-        return Response(status: clientRes.status)
+        throw Abort(.conflict, reason: "Could not find an available filename for archive")
     }
 }

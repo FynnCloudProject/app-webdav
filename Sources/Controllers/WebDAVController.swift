@@ -1,11 +1,16 @@
+import AsyncHTTPClient
 import Foundation
 import Vapor
 
 struct WebDAVController: RouteCollection {
-    let client: FynnCloudAPIClient
+    let client: FynnCloudAPIClient?
 
-    init(client: FynnCloudAPIClient = FynnCloudAPIClient()) {
+    init(client: FynnCloudAPIClient? = nil) {
         self.client = client
+    }
+
+    private func apiClient(for req: Request) -> FynnCloudAPIClient {
+        client ?? FynnCloudAPIClient(req: req)
     }
 
     private static let hrefAllowed: CharacterSet = {
@@ -72,6 +77,7 @@ struct WebDAVController: RouteCollection {
 
     func propfind(req: Request) async throws -> Response {
         let user = try req.auth.require(WebDAVUser.self)
+        let api = apiClient(for: req)
         let segments = pathSegments(req)
         let depth = req.headers.first(name: "Depth") ?? "1"
 
@@ -88,18 +94,18 @@ struct WebDAVController: RouteCollection {
                 created: nil
             ))
             if depth != "0" {
-                let children = try await client.listChildren(folderID: nil, token: user.token, on: req)
+                let children = try await api.listChildren(folderID: nil, token: user.token)
                 for child in children {
                     entries.append(makeEntry(child, req: req, segments: [child.filename]))
                 }
             }
         } else {
-            guard let target = try await client.resolvePath(segments, token: user.token, on: req) else {
+            guard let target = try await api.resolvePath(segments, token: user.token) else {
                 throw Abort(.notFound)
             }
             entries.append(makeEntry(target, req: req, segments: segments))
             if target.isDirectory && depth != "0" {
-                let children = try await client.listChildren(folderID: target.id, token: user.token, on: req)
+                let children = try await api.listChildren(folderID: target.id, token: user.token)
                 for child in children {
                     entries.append(makeEntry(child, req: req, segments: segments + [child.filename]))
                 }
@@ -111,8 +117,9 @@ struct WebDAVController: RouteCollection {
 
     func proppatch(req: Request) async throws -> Response {
         let user = try req.auth.require(WebDAVUser.self)
+        let api = apiClient(for: req)
         let segments = pathSegments(req)
-        let target = try await client.resolvePath(segments, token: user.token, on: req)
+        let target = try await api.resolvePath(segments, token: user.token)
         guard target != nil else { throw Abort(.notFound) }
 
         let isCollection = target?.isDirectory ?? true
@@ -131,9 +138,10 @@ struct WebDAVController: RouteCollection {
 
     func get(req: Request) async throws -> Response {
         let user = try req.auth.require(WebDAVUser.self)
+        let api = apiClient(for: req)
         let segments = pathSegments(req)
         guard !segments.isEmpty,
-              let file = try await client.resolvePath(segments, token: user.token, on: req) else {
+              let file = try await api.resolvePath(segments, token: user.token) else {
             throw Abort(.notFound)
         }
         guard !file.isDirectory else {
@@ -143,7 +151,7 @@ struct WebDAVController: RouteCollection {
             throw Abort(.internalServerError)
         }
 
-        let res = try await client.download(fileID: fileID, headers: req.headers, token: user.token, on: req)
+        let res = try await api.download(fileID: fileID, headers: req.headers, token: user.token)
         if req.method == .HEAD {
             res.body = .init()
             res.headers.replaceOrAdd(name: .contentLength, value: String(file.size))
@@ -153,12 +161,12 @@ struct WebDAVController: RouteCollection {
 
     func put(req: Request) async throws -> Response {
         let user = try req.auth.require(WebDAVUser.self)
+        let api = apiClient(for: req)
         let segments = pathSegments(req)
         guard let filename = segments.last, !filename.isEmpty else {
             throw Abort(.badRequest)
         }
 
-        // Ignore client sidecar metadata files (e.g. .DS_Store, ._*)
         if isPlatformMetadata(filename) {
             for try await _ in req.body {}
             return Response(status: .created)
@@ -169,39 +177,41 @@ struct WebDAVController: RouteCollection {
         let parentSegments = Array(segments.dropLast())
         let parentID = try await resolveParentID(req, segments: parentSegments, token: user.token)
 
-        return try await client.upload(
+        let bodyLength: HTTPClientRequest.Body.Length = contentLength.map { .known($0) } ?? .unknown
+        return try await api.upload(
             filename: filename,
             parentID: parentID,
-            stream: req.body,
+            body: .stream(req.body, length: bodyLength),
             contentLength: contentLength,
             contentType: contentType,
             token: user.token,
-            overwrite: true,
-            on: req
+            overwrite: true
         )
     }
 
     func mkcol(req: Request) async throws -> Response {
         let user = try req.auth.require(WebDAVUser.self)
+        let api = apiClient(for: req)
         let segments = pathSegments(req)
         guard let name = segments.last, !name.isEmpty else { throw Abort(.badRequest) }
 
-        if try await client.resolvePath(segments, token: user.token, on: req) != nil {
+        if try await api.resolvePath(segments, token: user.token) != nil {
             throw Abort(.methodNotAllowed, reason: "Resource already exists")
         }
 
         let parentSegments = Array(segments.dropLast())
         let parentID = try await resolveParentID(req, segments: parentSegments, token: user.token)
 
-        _ = try await client.createDirectory(name: name, parentID: parentID, token: user.token, on: req)
+        _ = try await api.createDirectory(name: name, parentID: parentID, token: user.token)
         return Response(status: .created)
     }
 
     func delete(req: Request) async throws -> Response {
         let user = try req.auth.require(WebDAVUser.self)
+        let api = apiClient(for: req)
         let segments = pathSegments(req)
         guard !segments.isEmpty,
-              let file = try await client.resolvePath(segments, token: user.token, on: req) else {
+              let file = try await api.resolvePath(segments, token: user.token) else {
             if let name = segments.last, isPlatformMetadata(name) {
                 return Response(status: .noContent)
             }
@@ -209,15 +219,16 @@ struct WebDAVController: RouteCollection {
         }
 
         guard let fileID = file.id else { throw Abort(.internalServerError) }
-        try await client.delete(fileID: fileID, token: user.token, on: req)
+        try await api.delete(fileID: fileID, token: user.token)
         return Response(status: .noContent)
     }
 
     func move(req: Request) async throws -> Response {
         let user = try req.auth.require(WebDAVUser.self)
+        let api = apiClient(for: req)
         let srcSegments = pathSegments(req)
         guard !srcSegments.isEmpty,
-              let source = try await client.resolvePath(srcSegments, token: user.token, on: req),
+              let source = try await api.resolvePath(srcSegments, token: user.token),
               let sourceID = source.id else {
             throw Abort(.notFound)
         }
@@ -229,19 +240,19 @@ struct WebDAVController: RouteCollection {
         let destParentID = try await resolveParentID(req, segments: destParentSegments, token: user.token)
 
         var created = true
-        if let existingDest = try await client.resolvePath(destSegments, token: user.token, on: req),
+        if let existingDest = try await api.resolvePath(destSegments, token: user.token),
            let existingID = existingDest.id {
             guard overwrite else { throw Abort(.preconditionFailed) }
-            try await client.delete(fileID: existingID, token: user.token, on: req)
+            try await api.delete(fileID: existingID, token: user.token)
             created = false
         }
 
         if source.parent?.id == destParentID {
-            _ = try await client.rename(fileID: sourceID, to: destName, token: user.token, on: req)
+            _ = try await api.rename(fileID: sourceID, to: destName, token: user.token)
         } else {
-            try await client.move(fileID: sourceID, toParentID: destParentID, token: user.token, on: req)
+            try await api.move(fileID: sourceID, toParentID: destParentID, token: user.token)
             if destName != source.filename {
-                _ = try await client.rename(fileID: sourceID, to: destName, token: user.token, on: req)
+                _ = try await api.rename(fileID: sourceID, to: destName, token: user.token)
             }
         }
 
@@ -250,9 +261,10 @@ struct WebDAVController: RouteCollection {
 
     func copy(req: Request) async throws -> Response {
         let user = try req.auth.require(WebDAVUser.self)
+        let api = apiClient(for: req)
         let srcSegments = pathSegments(req)
         guard !srcSegments.isEmpty,
-              let source = try await client.resolvePath(srcSegments, token: user.token, on: req),
+              let source = try await api.resolvePath(srcSegments, token: user.token),
               let sourceID = source.id else {
             throw Abort(.notFound)
         }
@@ -264,14 +276,14 @@ struct WebDAVController: RouteCollection {
         let destParentID = try await resolveParentID(req, segments: destParentSegments, token: user.token)
 
         var created = true
-        if let existingDest = try await client.resolvePath(destSegments, token: user.token, on: req),
+        if let existingDest = try await api.resolvePath(destSegments, token: user.token),
            let existingID = existingDest.id {
             guard overwrite else { throw Abort(.preconditionFailed) }
-            try await client.delete(fileID: existingID, token: user.token, on: req)
+            try await api.delete(fileID: existingID, token: user.token)
             created = false
         }
 
-        _ = try await client.copy(fileID: sourceID, toParentID: destParentID, newName: destName, token: user.token, on: req)
+        _ = try await api.copy(fileID: sourceID, toParentID: destParentID, newName: destName, token: user.token)
         return Response(status: created ? .created : .noContent)
     }
 
@@ -306,7 +318,8 @@ struct WebDAVController: RouteCollection {
 
     private func resolveParentID(_ req: Request, segments: [String], token: String) async throws -> UUID? {
         if segments.isEmpty { return nil }
-        guard let parent = try await client.resolvePath(segments, token: token, on: req), parent.isDirectory else {
+        let api = apiClient(for: req)
+        guard let parent = try await api.resolvePath(segments, token: token), parent.isDirectory else {
             throw Abort(.conflict, reason: "Parent collection does not exist")
         }
         return parent.id
