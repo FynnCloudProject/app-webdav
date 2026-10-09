@@ -1,0 +1,186 @@
+name: Build and Publish Docker Image
+
+on:
+  schedule:
+    - cron: "0 23 * * *"
+  push:
+    branches:
+      - "main"
+    tags:
+      - "v*.*.*"
+  pull_request:
+    branches:
+      - "main"
+  workflow_dispatch:
+
+concurrency:
+  group: docker-publish-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build_and_push:
+    name: Docker Build (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepare platform tag
+        id: prep
+        run: |
+          platform=${{ matrix.platform }}
+          echo "platform-tag=${platform//\//-}" >> $GITHUB_OUTPUT
+
+      - name: Configure image target names
+        id: target
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          repo="${GITHUB_REPOSITORY,,}"
+          canonical="ghcr.io/${owner}/app-webdav"
+          repotarget="ghcr.io/${repo}"
+
+          if [ "$canonical" = "$repotarget" ]; then
+            echo "images=$canonical" >> $GITHUB_OUTPUT
+          else
+            echo "images<<EOF" >> $GITHUB_OUTPUT
+            echo "$canonical" >> $GITHUB_OUTPUT
+            echo "$repotarget" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          fi
+          echo "primary=$canonical" >> $GITHUB_OUTPUT
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.target.outputs.images }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,prefix=sha-
+            type=ref,event=pr
+          flavor: |
+            latest=false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=buildkit-${{ steps.prep.outputs.platform-tag }}
+          cache-to: type=gha,mode=max,scope=buildkit-${{ steps.prep.outputs.platform-tag }}
+          outputs: type=image,name=${{ steps.target.outputs.primary }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
+          provenance: false
+
+      - name: Export digest
+        if: github.event_name != 'pull_request'
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ steps.prep.outputs.platform-tag }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Create multi-arch manifest
+    runs-on: ubuntu-24.04
+    if: github.event_name != 'pull_request'
+    needs: [build_and_push]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digests-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure image target names
+        id: target
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          repo="${GITHUB_REPOSITORY,,}"
+          canonical="ghcr.io/${owner}/app-webdav"
+          repotarget="ghcr.io/${repo}"
+
+          if [ "$canonical" = "$repotarget" ]; then
+            echo "images=$canonical" >> $GITHUB_OUTPUT
+          else
+            echo "images<<EOF" >> $GITHUB_OUTPUT
+            echo "$canonical" >> $GITHUB_OUTPUT
+            echo "$repotarget" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          fi
+          echo "primary=$canonical" >> $GITHUB_OUTPUT
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.target.outputs.images }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,prefix=sha-
+            type=ref,event=pr
+          flavor: |
+            latest=false
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          TAGS_ARGS=$(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          SOURCES=$(printf '${{ steps.target.outputs.primary }}@sha256:%s ' *)
+          docker buildx imagetools create $TAGS_ARGS $SOURCES
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect ${{ steps.target.outputs.primary }}:${{ steps.meta.outputs.version }}

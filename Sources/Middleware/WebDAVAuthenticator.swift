@@ -3,9 +3,17 @@ import Vapor
 
 struct WebDAVAuthenticator: AsyncMiddleware {
     let apiURL: String
+    let appID: String
+    let appSecret: String
 
-    init(apiURL: String = Environment.get("FYNNCLOUD_API_URL") ?? "http://127.0.0.1:8080") {
+    init(
+        apiURL: String = Environment.get("FYNNCLOUD_API_URL") ?? "http://127.0.0.1:8080",
+        appID: String = Environment.get("FYNNCLOUD_APP_ID") ?? Environment.get("APP_ID") ?? "webdav",
+        appSecret: String = Environment.get("FYNNCLOUD_APP_SECRET") ?? Environment.get("APP_SECRET") ?? ""
+    ) {
         self.apiURL = apiURL.hasSuffix("/") ? String(apiURL.dropLast()) : apiURL
+        self.appID = appID
+        self.appSecret = appSecret
     }
 
     func respond(to req: Request, chainingTo next: any AsyncResponder) async throws -> Response {
@@ -34,7 +42,10 @@ struct WebDAVAuthenticator: AsyncMiddleware {
         do {
             let res = try await req.client.post(verifyURI) { clientReq in
                 clientReq.headers.replaceOrAdd(name: .authorization, value: authHeader)
-                clientReq.headers.replaceOrAdd(name: "X-FynnCloud-App-ID", value: "webdav")
+                clientReq.headers.replaceOrAdd(name: "X-FynnCloud-App-ID", value: self.appID)
+                if !self.appSecret.isEmpty {
+                    clientReq.headers.replaceOrAdd(name: "X-FynnCloud-App-Secret", value: self.appSecret)
+                }
             }
 
             guard res.status == .ok, let body = res.body else {

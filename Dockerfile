@@ -9,7 +9,7 @@ COPY . .
 RUN swift build -c release --static-swift-stdlib
 
 # Runtime stage
-FROM ubuntu:noble-slim
+FROM ubuntu:noble
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
@@ -18,7 +18,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 COPY --from=build /build/.build/release/WebDAV /app/webdav
-COPY manifest.json /app/manifest.json
 
 ENV PORT=8080
 ENV HOST=0.0.0.0
