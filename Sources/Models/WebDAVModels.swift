@@ -43,3 +43,9 @@ struct DAVEntry {
     let lastModified: Date?
     let created: Date?
 }
+
+struct HealthResponse: Content {
+    let status: String
+    let app: String
+    let version: String
+}
