@@ -19,28 +19,8 @@ struct FynnCloudAPIClient: Sendable {
         self.baseURL = baseURL.hasSuffix("/") ? String(baseURL.dropLast()) : baseURL
     }
 
-    init(app: Application, baseURL: String = Environment.get("FYNNCLOUD_API_URL") ?? "http://127.0.0.1:8080") {
-        self.init(client: app.http.client.shared, baseURL: baseURL)
-    }
-
     init(req: Request, baseURL: String = Environment.get("FYNNCLOUD_API_URL") ?? "http://127.0.0.1:8080") {
         self.init(client: req.application.http.client.shared, baseURL: baseURL)
-    }
-
-    // MARK: - File Metadata & Navigation
-
-    func getFile(id: UUID, token: String) async throws -> FileIndexItemDTO {
-        var req = HTTPClientRequest(url: "\(baseURL)/api/files/\(id.uuidString)")
-        req.method = .GET
-        req.headers.bearerAuthorization = BearerAuthorization(token: token)
-
-        let res = try await client.execute(req, timeout: .seconds(30))
-        guard res.status == .ok else {
-            throw Abort(res.status, reason: "Unable to retrieve file \(id)")
-        }
-
-        let buffer = try await res.body.collect(upTo: 1024 * 1024)
-        return try Self.decoder.decode(FileIndexItemDTO.self, from: buffer)
     }
 
     func resolvePath(_ segments: [String], token: String) async throws -> FileIndexItemDTO? {
@@ -80,8 +60,6 @@ struct FynnCloudAPIClient: Sendable {
         let listing = try Self.decoder.decode(FileIndexDTO.self, from: buffer)
         return listing.files
     }
-
-    // MARK: - Directory & File Operations
 
     func createDirectory(name: String, parentID: UUID?, token: String) async throws -> FileIndexItemDTO {
         struct Payload: Content {
@@ -184,8 +162,6 @@ struct FynnCloudAPIClient: Sendable {
         }
     }
 
-    // MARK: - Download & Upload Streaming
-
     func download(fileID: UUID, headers: HTTPHeaders = [:], token: String) async throws -> Response {
         var req = HTTPClientRequest(url: "\(baseURL)/api/files/\(fileID.uuidString)/download")
         req.method = .GET
@@ -206,25 +182,6 @@ struct FynnCloudAPIClient: Sendable {
             }
         })
         return response
-    }
-
-    func download(fileID: UUID, to destination: URL, token: String) async throws {
-        var req = HTTPClientRequest(url: "\(baseURL)/api/files/\(fileID.uuidString)/download")
-        req.method = .GET
-        req.headers.bearerAuthorization = BearerAuthorization(token: token)
-
-        let res = try await client.execute(req, timeout: .minutes(10))
-        guard res.status == .ok else {
-            throw Abort(res.status, reason: "Failed to download file \(fileID)")
-        }
-
-        FileManager.default.createFile(atPath: destination.path, contents: nil)
-        let handle = try FileHandle(forWritingTo: destination)
-        defer { try? handle.close() }
-
-        for try await chunk in res.body {
-            handle.write(Data(buffer: chunk))
-        }
     }
 
     func upload(
@@ -261,56 +218,5 @@ struct FynnCloudAPIClient: Sendable {
             throw Abort(res.status)
         }
         return Response(status: res.status)
-    }
-
-    func uploadArchive(
-        name: String,
-        fileURL: URL,
-        size: Int64,
-        parentID: UUID?,
-        token: String
-    ) async throws -> (finalName: String, fileID: UUID?) {
-        let zipData = try Data(contentsOf: fileURL, options: .mappedIfSafe)
-        var candidateName = name
-
-        for attempt in 1...20 {
-            var query = [
-                "filename=\(candidateName.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? candidateName)",
-                "overwrite=false",
-                "size=\(size)",
-                "contentType=application/zip"
-            ]
-            if let parentID {
-                query.append("parentID=\(parentID.uuidString)")
-            }
-
-            var req = HTTPClientRequest(url: "\(baseURL)/api/files/upload?\(query.joined(separator: "&"))")
-            req.method = .POST
-            req.headers.bearerAuthorization = BearerAuthorization(token: token)
-            req.headers.replaceOrAdd(name: .contentType, value: "application/zip")
-            req.headers.replaceOrAdd(name: .contentLength, value: String(size))
-            req.body = .bytes(zipData)
-
-            let res = try await client.execute(req, timeout: .minutes(5))
-
-            if res.status == .ok || res.status == .created {
-                var createdID: UUID?
-                if let body = try? await res.body.collect(upTo: 64 * 1024) {
-                    struct UploadResult: Decodable { let id: UUID? }
-                    createdID = try? JSONDecoder().decode(UploadResult.self, from: body).id
-                }
-                return (candidateName, createdID)
-            }
-
-            if res.status == .conflict {
-                let stem = (name as NSString).deletingPathExtension
-                candidateName = "\(stem) (\(attempt)).zip"
-                continue
-            }
-
-            throw Abort(res.status, reason: "Failed to upload archive to destination")
-        }
-
-        throw Abort(.conflict, reason: "Could not find an available filename for archive")
     }
 }
