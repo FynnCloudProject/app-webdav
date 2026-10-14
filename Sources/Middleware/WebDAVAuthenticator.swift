@@ -17,6 +17,11 @@ struct WebDAVAuthenticator: AsyncMiddleware {
     }
 
     func respond(to req: Request, chainingTo next: any AsyncResponder) async throws -> Response {
+        if req.method == .GET && req.url.path == "/health" && req.headers.basicAuthorization == nil {
+            return try await HealthResponse(status: "healthy", app: "webdav", version: "1.0.0")
+                .encodeResponse(for: req)
+        }
+
         guard let basic = req.headers.basicAuthorization else {
             return challenge()
         }
@@ -24,7 +29,6 @@ struct WebDAVAuthenticator: AsyncMiddleware {
         let username = basic.username.lowercased()
         let password = basic.password
 
-        // Only app passwords (prefixed with fc_app_) are accepted for WebDAV
         guard password.hasPrefix("fc_app_") else {
             return challenge()
         }
