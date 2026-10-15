@@ -173,7 +173,10 @@ struct WebDAVController: RouteCollection {
         }
 
         let contentType = req.headers.first(name: .contentType) ?? "application/octet-stream"
-        let contentLength = req.headers.first(name: .contentLength).flatMap(Int64.init)
+        guard let contentLength = req.headers.first(name: .contentLength).flatMap(Int64.init),
+              contentLength >= 0 else {
+            throw Abort(.lengthRequired)
+        }
         let parentSegments = Array(segments.dropLast())
         let parentID = try await resolveParentID(req, segments: parentSegments, token: user.token)
 
