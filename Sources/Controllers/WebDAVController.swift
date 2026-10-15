@@ -177,15 +177,20 @@ struct WebDAVController: RouteCollection {
         let parentSegments = Array(segments.dropLast())
         let parentID = try await resolveParentID(req, segments: parentSegments, token: user.token)
 
-        let bodyLength: HTTPClientRequest.Body.Length = contentLength.map { .known($0) } ?? .unknown
+        let existing = try await api.resolvePath(segments, token: user.token)
+        if existing?.isDirectory == true {
+            for try await _ in req.body {}
+            throw Abort(.methodNotAllowed, reason: "Cannot PUT to a directory")
+        }
+
         return try await api.upload(
             filename: filename,
             parentID: parentID,
-            body: .stream(req.body, length: bodyLength),
+            existingFileID: existing?.id,
+            body: req.body,
             contentLength: contentLength,
             contentType: contentType,
-            token: user.token,
-            overwrite: true
+            token: user.token
         )
     }
 
